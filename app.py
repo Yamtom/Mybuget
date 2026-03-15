@@ -1,734 +1,738 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import date, datetime, timedelta
 import json
+import math
+import random
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
 
 from flask import Flask, jsonify, render_template, request
+from werkzeug.exceptions import HTTPException
+
+BASE_DIR = Path(__file__).resolve().parent
+BUDGET_FILE = BASE_DIR / "budget.json"
+LEGACY_BUDGET_FILE = BASE_DIR / "storage" / "budget.json"
+LEGACY_HISTORY_FILE = BASE_DIR / "storage" / "history.json"
+
+MAX_FORECAST_DAYS = 365
+HISTORY_LIMIT = 12
+DEFAULT_WATERLINE_PERCENT = 10.0
+MODE_ORDER = ("base", "economy", "aggressive", "force_majeure")
+MODE_LABELS = {
+    "base": "Базовий",
+    "economy": "Економний",
+    "aggressive": "Агресивний",
+    "force_majeure": "Форс-мажор",
+}
+MODE_CONFIG = {
+    "base": {"expense_multiplier": 1.0, "use_savings": True, "shock": False},
+    "economy": {"expense_multiplier": 0.88, "use_savings": True, "shock": False},
+    "aggressive": {"expense_multiplier": 1.2, "use_savings": False, "shock": False},
+    "force_majeure": {"expense_multiplier": 1.0, "use_savings": True, "shock": True},
+}
 
 app = Flask(__name__)
 
-BASE_DIR = Path(__file__).resolve().parent
-STORAGE_DIR = BASE_DIR / "storage"
-HISTORY_FILE = STORAGE_DIR / "history.json"
-BUDGET_FILE = STORAGE_DIR / "budget.json"
-MAX_HISTORY_ITEMS = 24
+
+def round_money(value: float) -> float:
+    return round(float(value) + 1e-9, 2)
 
 
-def _today() -> date:
-    return datetime.now().astimezone().date()
+def round_percent(value: float) -> float:
+    return round(float(value) + 1e-9, 4)
 
 
-DEFAULT_BUDGET = {
-    "available_budget": 24000,
-    "next_income_amount": 18000,
-    "next_income_date": (_today() + timedelta(days=12)).isoformat(),
-    "monthly_savings_percent": 18,
-    "daily_expense": 850,
-    "free_money": 4500,
-    "days": 30,
-    "events_text": "6;1400;Ліки\n13;3200;Ремонт\n24;1800;Свято",
-}
+def backup_invalid_path(path: Path) -> Path:
+    stamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    return path.with_name(f"{path.name}.invalid.{stamp}")
 
 
-@dataclass(frozen=True)
-class BudgetEvent:
-    day: int
-    amount: float
-    label: str
-
-
-@dataclass(frozen=True)
-class CalculationInput:
-    available_budget: float
-    next_income_amount: float
-    next_income_date: date
-    monthly_savings_percent: float
-    daily_expense: float
-    free_money: float
-    days: int
-    income_day: int | None
-    events: tuple[BudgetEvent, ...]
-    events_text: str
-
-
-@dataclass(frozen=True)
-class ScenarioConfig:
-    key: str
-    label: str
-    description: str
-    daily_expense_multiplier: float
-    reserve_multiplier: float
-    free_transfer_ratio: float
-    shock_day_ratio: float | None = None
-    shock_percent: float = 0.0
-
-
-SCENARIOS: tuple[ScenarioConfig, ...] = (
-    ScenarioConfig(
-        key="economy",
-        label="Економний",
-        description="Ріже щоденні витрати і докидає невикористаний ліміт у вільні гроші.",
-        daily_expense_multiplier=0.88,
-        reserve_multiplier=1.0,
-        free_transfer_ratio=1.0,
-    ),
-    ScenarioConfig(
-        key="base",
-        label="Базовий",
-        description="Працює з вашим темпом витрат і всіма запланованими точковими подіями.",
-        daily_expense_multiplier=1.0,
-        reserve_multiplier=1.0,
-        free_transfer_ratio=0.0,
-    ),
-    ScenarioConfig(
-        key="aggressive",
-        label="Агресивний",
-        description="Тягне витрати до верхньої межі комфорту і не тримає окремий резерв.",
-        daily_expense_multiplier=1.15,
-        reserve_multiplier=0.0,
-        free_transfer_ratio=0.0,
-    ),
-    ScenarioConfig(
-        key="force_majeure",
-        label="Форс-мажор",
-        description="Посеред горизонту зрізає 20% ресурсу, щоб перевірити запас міцності.",
-        daily_expense_multiplier=1.0,
-        reserve_multiplier=1.0,
-        free_transfer_ratio=0.0,
-        shock_day_ratio=0.55,
-        shock_percent=0.2,
-    ),
-)
-
-
-def _round_money(value: float) -> float:
-    return round(value, 2)
-
-
-def _ensure_storage() -> None:
-    STORAGE_DIR.mkdir(parents=True, exist_ok=True)
-
-    if not HISTORY_FILE.exists():
-        HISTORY_FILE.write_text("[]", encoding="utf-8")
-
-    if not BUDGET_FILE.exists():
-        BUDGET_FILE.write_text(
-            json.dumps(DEFAULT_BUDGET, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-
-
-def _read_json_file(path: Path, fallback: Any) -> Any:
-    _ensure_storage()
-
+def read_json(path: Path, *, backup_invalid: bool = False) -> Any:
+    if not path.exists():
+        return None
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return fallback
-
-
-def _write_json_file(path: Path, payload: Any) -> Any:
-    _ensure_storage()
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    return payload
-
-
-def _read_history() -> list[dict[str, Any]]:
-    payload = _read_json_file(HISTORY_FILE, [])
-    if not isinstance(payload, list):
-        return []
-
-    compatible_entries: list[dict[str, Any]] = []
-    required_keys = {
-        "available_budget",
-        "next_income_amount",
-        "next_income_date",
-        "monthly_savings_percent",
-        "daily_expense",
-        "free_money",
-        "days",
-    }
-
-    for entry in payload:
-        if not isinstance(entry, dict):
-            continue
-
-        inputs = entry.get("inputs")
-        summary = entry.get("summary")
-        if not isinstance(inputs, dict) or not isinstance(summary, dict):
-            continue
-
-        if not required_keys.issubset(inputs):
-            continue
-
-        compatible_entries.append(entry)
-
-    return compatible_entries
-
-
-def _write_history(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    trimmed = entries[:MAX_HISTORY_ITEMS]
-    return _write_json_file(HISTORY_FILE, trimmed)
-
-
-def _append_history(entry: dict[str, Any]) -> list[dict[str, Any]]:
-    history = _read_history()
-    history.insert(0, entry)
-    return _write_history(history)
-
-
-def _read_budget() -> dict[str, Any]:
-    payload = _read_json_file(BUDGET_FILE, DEFAULT_BUDGET)
-    if isinstance(payload, dict):
-        return {**DEFAULT_BUDGET, **payload}
-    return DEFAULT_BUDGET.copy()
-
-
-def _write_budget(payload: dict[str, Any]) -> dict[str, Any]:
-    normalized = {**DEFAULT_BUDGET, **payload}
-    return _write_json_file(BUDGET_FILE, normalized)
-
-
-def _get_value(payload: dict[str, Any], key: str, aliases: tuple[str, ...] = ()) -> Any:
-    for candidate in (key, *aliases):
-        if candidate in payload:
-            return payload[candidate]
-    raise ValueError(f"Поле '{key}' є обов'язковим")
-
-
-def _to_float(
-    payload: dict[str, Any],
-    key: str,
-    *,
-    aliases: tuple[str, ...] = (),
-    min_value: float = 0.0,
-    max_value: float | None = None,
-) -> float:
-    raw_value = _get_value(payload, key, aliases)
-
-    try:
-        value = float(raw_value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"Поле '{key}' має бути числом") from exc
-
-    if value < min_value:
-        raise ValueError(f"Поле '{key}' має бути не менше {min_value}")
-
-    if max_value is not None and value > max_value:
-        raise ValueError(f"Поле '{key}' має бути не більше {max_value}")
-
-    return value
-
-
-def _to_date(payload: dict[str, Any], key: str, *, aliases: tuple[str, ...] = ()) -> date:
-    raw_value = _get_value(payload, key, aliases)
-
-    try:
-        value = date.fromisoformat(str(raw_value))
-    except ValueError as exc:
-        raise ValueError(f"Поле '{key}' має бути датою у форматі YYYY-MM-DD") from exc
-
-    if value < _today():
-        raise ValueError(f"Поле '{key}' не може бути раніше сьогоднішньої дати")
-
-    return value
-
-
-def _parse_events(events_text: str, days: int) -> tuple[BudgetEvent, ...]:
-    events: list[BudgetEvent] = []
-
-    for line_number, raw_line in enumerate(events_text.splitlines(), start=1):
-        line = raw_line.strip()
-        if not line:
-            continue
-
-        if ";" in line:
-            parts = [part.strip() for part in line.split(";", 2)]
-        elif "|" in line:
-            parts = [part.strip() for part in line.split("|", 2)]
-        else:
-            raise ValueError(f"Рядок події {line_number} має формат 'день;сума;назва'.")
-
-        if len(parts) < 2:
-            raise ValueError(f"Рядок події {line_number} має містити щонайменше день і суму.")
-
-        try:
-            day = int(float(parts[0]))
-            amount = float(parts[1])
-        except ValueError as exc:
-            raise ValueError(f"Рядок події {line_number} містить некоректне число або день.") from exc
-
-        if day < 1 or day > days:
-            raise ValueError(f"Подія в рядку {line_number} має день у межах 1..{days}.")
-
-        if amount < 0:
-            raise ValueError(f"Сума події в рядку {line_number} не може бути від'ємною.")
-
-        label = parts[2] if len(parts) == 3 and parts[2] else f"Подія {len(events) + 1}"
-        events.append(BudgetEvent(day=day, amount=amount, label=label))
-
-    return tuple(sorted(events, key=lambda item: item.day))
-
-
-def _serialize_budget(data: CalculationInput) -> dict[str, Any]:
-    return {
-        "available_budget": _round_money(data.available_budget),
-        "next_income_amount": _round_money(data.next_income_amount),
-        "next_income_date": data.next_income_date.isoformat(),
-        "monthly_savings_percent": _round_money(data.monthly_savings_percent),
-        "daily_expense": _round_money(data.daily_expense),
-        "free_money": _round_money(data.free_money),
-        "days": data.days,
-        "events_text": data.events_text,
-    }
-
-
-def _income_day(next_income_date: date, days: int) -> int | None:
-    delta = (next_income_date - _today()).days + 1
-    if delta < 1:
-        return 1
-    if delta > days:
+    except (OSError, json.JSONDecodeError):
+        if backup_invalid:
+            try:
+                path.replace(backup_invalid_path(path))
+            except OSError:
+                pass
         return None
-    return delta
 
 
-def _parse_request(payload: dict[str, Any]) -> CalculationInput:
-    days = int(_to_float(payload, "days", aliases=("forecast_days",), min_value=7, max_value=180))
-    next_income_date = _to_date(payload, "next_income_date", aliases=("income_date", "next_income_eta"))
-    events_text = str(payload.get("events_text", payload.get("events", "")) or "").strip()
-
-    data = CalculationInput(
-        available_budget=_to_float(
-            payload,
-            "available_budget",
-            aliases=("starting_balance", "current_balance", "available_funds"),
-            min_value=0.0,
-        ),
-        next_income_amount=_to_float(
-            payload,
-            "next_income_amount",
-            aliases=("income_amount", "income", "monthly_income"),
-            min_value=0.0,
-        ),
-        next_income_date=next_income_date,
-        monthly_savings_percent=_to_float(
-            payload,
-            "monthly_savings_percent",
-            aliases=("savings_percent", "monthly_savings_pct"),
-            min_value=0.0,
-            max_value=100.0,
-        ),
-        daily_expense=_to_float(
-            payload,
-            "daily_expense",
-            aliases=("daily_operating_expense", "expense_amount"),
-            min_value=0.0,
-        ),
-        free_money=_to_float(
-            payload,
-            "free_money",
-            aliases=("free_funds", "extra_funds"),
-            min_value=0.0,
-        ),
-        days=days,
-        income_day=_income_day(next_income_date, days),
-        events=_parse_events(events_text, days),
-        events_text=events_text,
-    )
-
-    return data
+def write_json(path: Path, payload: Any) -> None:
+    temp_path = path.with_name(f"{path.name}.tmp")
+    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_path.replace(path)
 
 
-def _to_bool(value: Any, default: bool = True) -> bool:
-    if value is None:
-        return default
-
+def as_bool(value: Any) -> bool:
     if isinstance(value, bool):
         return value
-
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        if normalized in {"1", "true", "yes", "on"}:
-            return True
-        if normalized in {"0", "false", "no", "off"}:
-            return False
-
-    return bool(value)
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _risk_level(
+def as_date(value: Any, field_name: str) -> date:
+    if isinstance(value, date):
+        return value
+    if value in (None, ""):
+        raise ValueError(f"Поле '{field_name}' обов'язкове.")
+    try:
+        return date.fromisoformat(str(value))
+    except ValueError as error:
+        raise ValueError(f"Поле '{field_name}' має бути у форматі YYYY-MM-DD.") from error
+
+
+def as_float(
+    value: Any,
+    field_name: str,
     *,
-    zero_day: int | None,
-    waterline_day: int | None,
-    first_stress_day: int | None,
-    reserve_draw_day: int | None,
-) -> tuple[str, str]:
-    if zero_day is not None:
-        return "critical", "Критичний"
+    minimum: float = 0.0,
+    maximum: float | None = None,
+) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"Поле '{field_name}' має бути числом.") from error
+    if not math.isfinite(parsed):
+        raise ValueError(f"Поле '{field_name}' має бути скінченним числом.")
+    if parsed < minimum:
+        raise ValueError(f"Поле '{field_name}' не може бути меншим за {minimum}.")
+    if maximum is not None and parsed > maximum:
+        raise ValueError(f"Поле '{field_name}' не може бути більшим за {maximum}.")
+    return round_money(parsed)
 
-    if waterline_day is not None or first_stress_day is not None or reserve_draw_day is not None:
-        return "warning", "Напружений"
 
-    return "stable", "Стабільний"
-
-
-def _build_narrative(
+def as_int(
+    value: Any,
+    field_name: str,
     *,
-    zero_day: int | None,
-    waterline_day: int | None,
-    reserve_draw_day: int | None,
-    first_stress_day: int | None,
-    income_day: int | None,
-    free_money_gain: float,
-) -> str:
-    if zero_day is not None:
-        return f"На {zero_day}-й день сумарний ресурс іде в мінус. Такий режим не дотягує до кінця горизонту."
-
-    if waterline_day is not None:
-        return f"На {waterline_day}-й день ви доходите до резервної ватерлінії і починаєте ризикувати ціллю збережень."
-
-    if reserve_draw_day is not None:
-        return f"На {reserve_draw_day}-й день починається використання вільних грошей як подушки для виживання."
-
-    if first_stress_day is not None:
-        return f"З {first_stress_day}-го дня денна пайка стає тісною і будь-яке перевищення вже ріже наступні ліміти."
-
-    if free_money_gain > 0:
-        return "Сценарій не лише проходить горизонт, а й поповнює вільні гроші з невикористаної пайки."
-
-    if income_day is not None:
-        return f"Сценарій рівно дотягує до доходу на {income_day}-й день і лишається в контрольованій зоні."
-
-    return "Сценарій тримає горизонт без зриву і без заходу в резерв."
+    minimum: int = 1,
+    maximum: int | None = None,
+) -> int:
+    try:
+        parsed = int(str(value))
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"Поле '{field_name}' має бути цілим числом.") from error
+    if parsed < minimum:
+        raise ValueError(f"Поле '{field_name}' не може бути меншим за {minimum}.")
+    if maximum is not None and parsed > maximum:
+        raise ValueError(f"Поле '{field_name}' не може бути більшим за {maximum}.")
+    return parsed
 
 
-def simulate_scenario(data: CalculationInput, config: ScenarioConfig) -> dict[str, Any]:
-    budget_balance = data.available_budget
-    free_money_balance = data.free_money
-    planned_daily_spend = data.daily_expense * config.daily_expense_multiplier
-    monthly_base = data.available_budget + data.free_money
-    if data.income_day is not None:
-        monthly_base += data.next_income_amount
-    target_reserve = monthly_base * (data.monthly_savings_percent / 100.0) * config.reserve_multiplier
-    events_by_day: dict[int, list[BudgetEvent]] = {}
+def default_visible_modes() -> dict[str, bool]:
+    return {mode: True for mode in MODE_ORDER}
 
-    for event in data.events:
-        events_by_day.setdefault(event.day, []).append(event)
 
-    first_stress_day: int | None = None
-    waterline_day: int | None = None
-    reserve_draw_day: int | None = None
-    zero_day: int | None = None
-    min_total_day = 1
-    min_total_assets = budget_balance + free_money_balance
-    tightest_limit: float | None = None
-    total_events_cost = 0.0
-    total_shock_cost = 0.0
-    projection: list[dict[str, Any]] = []
+def first_visible_mode(visible_modes: dict[str, bool]) -> str:
+    for mode in MODE_ORDER:
+        if visible_modes.get(mode):
+            return mode
+    return "base"
 
-    shock_day = None
-    if config.shock_day_ratio is not None:
-        shock_day = max(1, min(data.days, round(data.days * config.shock_day_ratio)))
 
-    for day in range(1, data.days + 1):
-        current_date = _today() + timedelta(days=day - 1)
-        income_received = 0.0
-        if data.income_day == day:
-            budget_balance += data.next_income_amount
-            income_received = data.next_income_amount
+def normalize_visible_modes(raw_value: Any) -> dict[str, bool]:
+    defaults = default_visible_modes()
+    if not isinstance(raw_value, dict):
+        return defaults
+    normalized = {mode: as_bool(raw_value.get(mode, defaults[mode])) for mode in MODE_ORDER}
+    if not any(normalized.values()):
+        normalized["base"] = True
+    return normalized
 
-        start_budget = budget_balance
-        start_free_money = free_money_balance
-        start_total_assets = start_budget + start_free_money
-        remaining_days = data.days - day + 1
-        future_income = data.next_income_amount if data.income_day is not None and day < data.income_day else 0.0
-        adaptive_limit = max((start_total_assets + future_income - target_reserve) / remaining_days, 0.0)
 
-        event_items = events_by_day.get(day, [])
-        event_total = sum(item.amount for item in event_items)
-        event_labels = ", ".join(item.label for item in event_items)
-        shock_loss = start_total_assets * config.shock_percent if day == shock_day else 0.0
-        total_spend = planned_daily_spend + event_total + shock_loss
-        reserve_draw = max(total_spend - max(start_budget, 0.0), 0.0)
+def normalize_active_mode(raw_value: Any, visible_modes: dict[str, bool]) -> str:
+    candidate = str(raw_value or "").strip()
+    if candidate not in MODE_ORDER:
+        candidate = "base"
+    if not visible_modes.get(candidate):
+        candidate = first_visible_mode(visible_modes)
+    return candidate
 
-        budget_balance -= total_spend
-        if budget_balance < 0 and free_money_balance > 0:
-            spill = min(free_money_balance, -budget_balance)
-            free_money_balance -= spill
-            budget_balance += spill
 
-        unused_headroom = max(adaptive_limit - total_spend, 0.0)
-        free_transfer = min(max(budget_balance, 0.0), unused_headroom * config.free_transfer_ratio)
-        if free_transfer > 0:
-            budget_balance -= free_transfer
-            free_money_balance += free_transfer
+def balance_date_value(value: Any, fallback: date) -> date:
+    if value in (None, ""):
+        return fallback
+    return as_date(value, "balance_date")
 
-        end_total_assets = budget_balance + free_money_balance
-        next_future_income = data.next_income_amount if data.income_day is not None and day < data.income_day else 0.0
-        next_limit = 0.0
-        if remaining_days > 1:
-            next_limit = max((end_total_assets + next_future_income - target_reserve) / (remaining_days - 1), 0.0)
 
-        is_stress_day = total_spend > adaptive_limit + 1e-9
-        is_waterline_day = end_total_assets <= target_reserve + 1e-9
-        is_negative_day = end_total_assets < 0
-        is_reserve_draw_day = reserve_draw > 1e-9
+def derive_end_date(balance_date: date, forecast_days: int) -> date:
+    return balance_date + timedelta(days=forecast_days - 1)
 
-        if first_stress_day is None and is_stress_day:
-            first_stress_day = day
 
-        if reserve_draw_day is None and is_reserve_draw_day:
-            reserve_draw_day = day
-
-        if waterline_day is None and is_waterline_day:
-            waterline_day = day
-
-        if zero_day is None and is_negative_day:
-            zero_day = day
-
-        if end_total_assets < min_total_assets:
-            min_total_assets = end_total_assets
-            min_total_day = day
-
-        if tightest_limit is None or adaptive_limit < tightest_limit:
-            tightest_limit = adaptive_limit
-
-        total_events_cost += event_total
-        total_shock_cost += shock_loss
-
-        projection.append(
-            {
-                "day": day,
-                "date": current_date.isoformat(),
-                "income_received": _round_money(income_received),
-                "start_budget": _round_money(start_budget),
-                "start_free_money": _round_money(start_free_money),
-                "start_total_assets": _round_money(start_total_assets),
-                "adaptive_limit": _round_money(adaptive_limit),
-                "planned_daily_spend": _round_money(planned_daily_spend),
-                "event_total": _round_money(event_total),
-                "event_labels": event_labels,
-                "shock_loss": _round_money(shock_loss),
-                "reserve_draw": _round_money(reserve_draw),
-                "free_transfer": _round_money(free_transfer),
-                "end_budget": _round_money(budget_balance),
-                "end_free_money": _round_money(free_money_balance),
-                "end_total_assets": _round_money(end_total_assets),
-                "next_limit": _round_money(next_limit),
-                "target_reserve": _round_money(target_reserve),
-                "is_stress_day": is_stress_day,
-                "is_waterline_day": is_waterline_day,
-                "is_negative_day": is_negative_day,
-                "is_shock_day": day == shock_day,
-                "is_income_day": income_received > 0,
-                "is_reserve_draw_day": is_reserve_draw_day,
-            }
-        )
-
-    free_money_gain = free_money_balance - data.free_money
-    risk_level, risk_label = _risk_level(
-        zero_day=zero_day,
-        waterline_day=waterline_day,
-        first_stress_day=first_stress_day,
-        reserve_draw_day=reserve_draw_day,
-    )
-    narrative = _build_narrative(
-        zero_day=zero_day,
-        waterline_day=waterline_day,
-        reserve_draw_day=reserve_draw_day,
-        first_stress_day=first_stress_day,
-        income_day=data.income_day,
-        free_money_gain=free_money_gain,
-    )
-
-    critical_points: list[dict[str, Any]] = [
-        {
-            "type": "low-point",
-            "level": "info",
-            "day": min_total_day,
-            "title": "Найнижчий сумарний ресурс",
-            "message": f"Найглибше просідання стається на {min_total_day}-й день: {round(min_total_assets, 2)} грн.",
-        }
-    ]
-
-    if data.income_day is not None:
-        critical_points.append(
-            {
-                "type": "income",
-                "level": "info",
-                "day": data.income_day,
-                "title": "Ймовірна дата доходу",
-                "message": f"На {data.income_day}-й день модель додає {round(data.next_income_amount, 2)} грн до бюджету.",
-            }
-        )
-
-    if first_stress_day is not None:
-        critical_points.append(
-            {
-                "type": "stress",
-                "level": "warning",
-                "day": first_stress_day,
-                "title": "Пайка стискається",
-                "message": f"З {first_stress_day}-го дня фактичні витрати вже вищі за безпечний денний ліміт.",
-            }
-        )
-
-    if reserve_draw_day is not None:
-        critical_points.append(
-            {
-                "type": "reserve-draw",
-                "level": "warning" if zero_day is None else "critical",
-                "day": reserve_draw_day,
-                "title": "Починається використання вільних грошей",
-                "message": f"На {reserve_draw_day}-й день операційний бюджет уже не покриває витрату самостійно.",
-            }
-        )
-
-    if waterline_day is not None:
-        critical_points.append(
-            {
-                "type": "waterline",
-                "level": "warning" if zero_day is None else "critical",
-                "day": waterline_day,
-                "title": "Досягнута ватерлінія",
-                "message": f"На {waterline_day}-й день сумарний ресурс падає до цільового резерву.",
-            }
-        )
-
-    if shock_day is not None:
-        critical_points.append(
-            {
-                "type": "shock",
-                "level": "warning" if zero_day is None else "critical",
-                "day": shock_day,
-                "title": "Форс-мажорний удар",
-                "message": f"На {shock_day}-й день сценарій списує {round(total_shock_cost, 2)} грн як раптову втрату ресурсу.",
-            }
-        )
-
-    if zero_day is not None:
-        critical_points.append(
-            {
-                "type": "negative",
-                "level": "critical",
-                "day": zero_day,
-                "title": "Ресурс іде в мінус",
-                "message": f"На {zero_day}-й день режим перестає дотягувати до кінця горизонту.",
-            }
-        )
-
-    summary = {
-        "label": config.label,
-        "description": config.description,
-        "risk_level": risk_level,
-        "risk_label": risk_label,
-        "final_total_assets": _round_money(budget_balance + free_money_balance),
-        "final_budget_balance": _round_money(budget_balance),
-        "final_free_money": _round_money(free_money_balance),
-        "target_reserve": _round_money(target_reserve),
-        "monthly_savings_percent": _round_money(data.monthly_savings_percent * config.reserve_multiplier),
-        "planned_daily_spend": _round_money(planned_daily_spend),
-        "tightest_limit": _round_money(tightest_limit or 0.0),
-        "min_total_assets": _round_money(min_total_assets),
-        "min_total_day": min_total_day,
-        "first_stress_day": first_stress_day,
-        "reserve_draw_day": reserve_draw_day,
-        "waterline_day": waterline_day,
-        "zero_day": zero_day,
-        "income_day": data.income_day,
-        "income_date": data.next_income_date.isoformat(),
-        "income_amount": _round_money(data.next_income_amount),
-        "free_money_gain": _round_money(free_money_gain),
-        "total_events_cost": _round_money(total_events_cost),
-        "total_shock_cost": _round_money(total_shock_cost),
-        "narrative": narrative,
-    }
-
+def default_settings(balance_date: date | None = None) -> dict[str, Any]:
+    current_date = balance_date or date.today()
+    forecast_days = 30
     return {
-        "key": config.key,
-        "label": config.label,
-        "description": config.description,
-        "summary": summary,
-        "critical_points": critical_points,
-        "projection": projection,
+        "current_balance": 24000.0,
+        "balance_date": current_date.isoformat(),
+        "forecast_days": forecast_days,
+        "end_date": derive_end_date(current_date, forecast_days).isoformat(),
+        "next_income_date": (current_date + timedelta(days=14)).isoformat(),
+        "next_income_amount": 18000.0,
+        "savings_goal_percent": 20.0,
+        "required_expense_percent": 3.0,
+        "free_money_percent": 5.0,
+        "waterline_percent": DEFAULT_WATERLINE_PERCENT,
+        "visible_modes": default_visible_modes(),
+        "active_mode": "base",
     }
 
 
-def _build_response(data: CalculationInput, history: list[dict[str, Any]]) -> dict[str, Any]:
-    scenarios: dict[str, Any] = {}
-    comparison: list[dict[str, Any]] = []
+def income_in_horizon(settings: dict[str, Any]) -> float:
+    start = as_date(settings["balance_date"], "balance_date")
+    end = as_date(settings["end_date"], "end_date")
+    income_date = as_date(settings["next_income_date"], "next_income_date")
+    if start <= income_date <= end:
+        return settings["next_income_amount"]
+    return 0.0
 
-    for config in SCENARIOS:
-        scenario = simulate_scenario(data, config)
-        scenarios[config.key] = scenario
-        summary = scenario["summary"]
-        comparison.append(
-            {
-                "key": config.key,
-                "label": config.label,
-                "description": config.description,
-                "risk_level": summary["risk_level"],
-                "risk_label": summary["risk_label"],
-                "final_total_assets": summary["final_total_assets"],
-                "final_free_money": summary["final_free_money"],
-                "target_reserve": summary["target_reserve"],
-                "tightest_limit": summary["tightest_limit"],
-                "waterline_day": summary["waterline_day"],
-                "reserve_draw_day": summary["reserve_draw_day"],
-                "zero_day": summary["zero_day"],
-                "income_day": summary["income_day"],
-            }
-        )
 
-    return {
-        "meta": {
-            "today": _today().isoformat(),
-            "days": data.days,
-            "next_income_amount": _round_money(data.next_income_amount),
-            "next_income_date": data.next_income_date.isoformat(),
-            "income_day": data.income_day,
-            "monthly_savings_percent": _round_money(data.monthly_savings_percent),
-            "events": [
+def resource_within_horizon(settings: dict[str, Any]) -> float:
+    return round_money(settings["current_balance"] + income_in_horizon(settings))
+
+
+def waterline_amount(settings: dict[str, Any]) -> float:
+    return round_money(settings["current_balance"] * settings["waterline_percent"] / 100)
+
+
+def savings_target_amount(settings: dict[str, Any], *, use_savings: bool) -> float:
+    if not use_savings:
+        return 0.0
+    return round_money(resource_within_horizon(settings) * settings["savings_goal_percent"] / 100)
+
+
+def required_percent_for_mode(settings: dict[str, Any], mode_key: str) -> float:
+    percent = settings["required_expense_percent"] * MODE_CONFIG[mode_key]["expense_multiplier"]
+    return round_percent(min(max(percent, 0.0), 100.0))
+
+
+def percent_from_amount(amount: float, resource: float) -> float:
+    if resource <= 0:
+        return 0.0
+    return round_percent(min(max((amount / resource) * 100, 0.0), 100.0))
+
+
+def percent_from_daily_amount(amount: float, balance: float) -> float:
+    if balance <= 0:
+        return 0.0
+    return round_percent(min(max((amount / balance) * 100, 0.0), 100.0))
+
+
+def split_event_line(line: str) -> list[str]:
+    for delimiter in (";", "|"):
+        if delimiter in line:
+            parts = [part.strip() for part in line.split(delimiter, 2)]
+            if len(parts) == 3:
+                return parts
+    raise ValueError("Подія має бути у форматі YYYY-MM-DD;Назва;Сума.")
+
+
+def parse_event_date_token(token: str, reference_date: date | None = None) -> date:
+    cleaned = token.strip()
+    try:
+        return as_date(cleaned, "event_date")
+    except ValueError:
+        if reference_date is None:
+            raise ValueError(f"Невірна дата події: {token}")
+    try:
+        day_offset = int(cleaned)
+    except ValueError as error:
+        raise ValueError(f"Невірна дата події: {token}") from error
+    if day_offset < 1:
+        raise ValueError("Номер дня події має бути від 1.")
+    return reference_date + timedelta(days=day_offset - 1)
+
+
+def normalize_events(raw_events: Any, reference_date: date | None = None) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    if raw_events is None:
+        return normalized
+    if isinstance(raw_events, str):
+        for line in [item.strip() for item in raw_events.splitlines() if item.strip()]:
+            raw_date, raw_name, raw_amount = split_event_line(line)
+            normalized.append(
                 {
-                    "day": event.day,
-                    "amount": _round_money(event.amount),
-                    "label": event.label,
+                    "date": parse_event_date_token(raw_date, reference_date).isoformat(),
+                    "name": raw_name or "Подія",
+                    "amount": as_float(raw_amount, "event_amount", minimum=0.0),
                 }
-                for event in data.events
-            ],
-        },
-        "budget": _serialize_budget(data),
-        "default_scenario": "base",
-        "comparison": comparison,
-        "scenarios": scenarios,
-        "history": history,
+            )
+    elif isinstance(raw_events, list):
+        for item in raw_events:
+            if not isinstance(item, dict):
+                continue
+            normalized.append(
+                {
+                    "date": parse_event_date_token(str(item.get("date", "")).strip(), reference_date).isoformat(),
+                    "name": str(item.get("name") or item.get("label") or "Подія").strip(),
+                    "amount": as_float(item.get("amount", 0), "event_amount", minimum=0.0),
+                }
+            )
+    else:
+        raise ValueError("Невірний формат списку подій.")
+    normalized.sort(key=lambda item: (item["date"], item["name"]))
+    return normalized
+
+
+def events_to_text(events: list[dict[str, Any]]) -> str:
+    return "\n".join(
+        f"{event['date']};{event['name']};{round_money(event['amount']):.2f}" for event in events
+    )
+
+
+def normalize_settings(
+    raw_settings: dict[str, Any] | None,
+    *,
+    fallback_balance_date: date,
+    override_balance_date: date | None = None,
+) -> dict[str, Any]:
+    source = raw_settings or {}
+    balance_date = override_balance_date or balance_date_value(source.get("balance_date"), fallback_balance_date)
+    defaults = default_settings(balance_date)
+    forecast_days = as_int(
+        source.get("forecast_days", defaults["forecast_days"]),
+        "forecast_days",
+        minimum=1,
+        maximum=MAX_FORECAST_DAYS,
+    )
+    visible_modes = normalize_visible_modes(source.get("visible_modes"))
+    active_mode = normalize_active_mode(source.get("active_mode", defaults["active_mode"]), visible_modes)
+    return {
+        "current_balance": as_float(
+            source.get("current_balance", defaults["current_balance"]),
+            "current_balance",
+            minimum=0.0,
+        ),
+        "balance_date": balance_date.isoformat(),
+        "forecast_days": forecast_days,
+        "end_date": derive_end_date(balance_date, forecast_days).isoformat(),
+        "next_income_date": as_date(
+            source.get("next_income_date", defaults["next_income_date"]),
+            "next_income_date",
+        ).isoformat(),
+        "next_income_amount": as_float(
+            source.get("next_income_amount", defaults["next_income_amount"]),
+            "next_income_amount",
+            minimum=0.0,
+        ),
+        "savings_goal_percent": as_float(
+            source.get("savings_goal_percent", defaults["savings_goal_percent"]),
+            "savings_goal_percent",
+            minimum=0.0,
+            maximum=100.0,
+        ),
+        "required_expense_percent": as_float(
+            source.get("required_expense_percent", defaults["required_expense_percent"]),
+            "required_expense_percent",
+            minimum=0.0,
+            maximum=100.0,
+        ),
+        "free_money_percent": as_float(
+            source.get("free_money_percent", defaults["free_money_percent"]),
+            "free_money_percent",
+            minimum=0.0,
+            maximum=100.0,
+        ),
+        "waterline_percent": as_float(
+            source.get("waterline_percent", defaults["waterline_percent"]),
+            "waterline_percent",
+            minimum=0.0,
+            maximum=100.0,
+        ),
+        "visible_modes": visible_modes,
+        "active_mode": active_mode,
     }
 
 
-def build_forecast(data: CalculationInput, *, save_history: bool) -> dict[str, Any]:
-    budget_payload = _write_budget(_serialize_budget(data))
-    history = _read_history()
+def migrate_previous_settings(raw_settings: dict[str, Any], scenarios: dict[str, Any] | None) -> dict[str, Any]:
+    fallback_date = date.today()
+    start = balance_date_value(raw_settings.get("start_date"), fallback_date)
+    end = balance_date_value(raw_settings.get("end_date"), start)
+    forecast_days = max((end - start).days + 1, 1)
+    current_balance = round_money(raw_settings.get("initial_balance", raw_settings.get("current_balance", 0)))
+    next_income_amount = round_money(raw_settings.get("next_income_amount", 0))
+    next_income_date = raw_settings.get("next_income_date", (start + timedelta(days=14)).isoformat())
+    target_amount = round_money(raw_settings.get("target_savings_amount", 0))
+    resource = current_balance
+    try:
+        income_date = as_date(next_income_date, "next_income_date")
+        if start <= income_date <= end:
+            resource = round_money(resource + next_income_amount)
+    except ValueError:
+        next_income_date = (start + timedelta(days=14)).isoformat()
+    base_summary = (scenarios or {}).get("base", {}).get("summary", {}) if isinstance(scenarios, dict) else {}
+    base_limit = round_money(base_summary.get("base_daily_limit", raw_settings.get("daily_expense", 0)))
+    return {
+        "current_balance": current_balance,
+        "balance_date": start.isoformat(),
+        "forecast_days": forecast_days,
+        "next_income_date": next_income_date,
+        "next_income_amount": next_income_amount,
+        "savings_goal_percent": percent_from_amount(target_amount, resource),
+        "required_expense_percent": percent_from_daily_amount(base_limit, current_balance),
+        "free_money_percent": 0.0,
+        "waterline_percent": raw_settings.get("waterline_percent", DEFAULT_WATERLINE_PERCENT),
+        "visible_modes": default_visible_modes(),
+        "active_mode": "force_majeure" if as_bool(raw_settings.get("stress_mode", False)) else "base",
+    }
 
-    if save_history:
-        base_summary = simulate_scenario(data, SCENARIOS[1])["summary"]
-        history_entry = {
-            "id": uuid4().hex,
-            "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-            "inputs": budget_payload,
-            "summary": {
-                "final_total_assets": base_summary["final_total_assets"],
-                "final_free_money": base_summary["final_free_money"],
-                "target_reserve": base_summary["target_reserve"],
-                "zero_day": base_summary["zero_day"],
-            },
-        }
-        history = _append_history(history_entry)
 
-    return _build_response(data, history)
+def migrate_legacy_budget(raw_budget: dict[str, Any]) -> dict[str, Any]:
+    current_balance = round_money(raw_budget.get("available_budget", 0) + raw_budget.get("free_money", 0))
+    forecast_days = as_int(raw_budget.get("days", 30), "days", minimum=1, maximum=MAX_FORECAST_DAYS)
+    current_date = date.today()
+    return {
+        "current_balance": current_balance,
+        "balance_date": current_date.isoformat(),
+        "forecast_days": forecast_days,
+        "next_income_date": raw_budget.get("next_income_date", (current_date + timedelta(days=14)).isoformat()),
+        "next_income_amount": raw_budget.get("next_income_amount", 0),
+        "savings_goal_percent": raw_budget.get("monthly_savings_percent", 0),
+        "required_expense_percent": percent_from_daily_amount(raw_budget.get("daily_expense", 0), current_balance),
+        "free_money_percent": 0.0,
+        "waterline_percent": DEFAULT_WATERLINE_PERCENT,
+        "visible_modes": default_visible_modes(),
+        "active_mode": "base",
+    }
+
+
+def normalize_history(items: Any) -> list[dict[str, Any]]:
+    history: list[dict[str, Any]] = []
+    if not isinstance(items, list):
+        return history
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        raw_settings = item.get("settings")
+        raw_summary = item.get("summary")
+        created_at = str(item.get("created_at", "")).strip()
+        if not isinstance(raw_settings, dict) or not isinstance(raw_summary, dict) or not created_at:
+            continue
+        if "current_balance" in raw_settings or "forecast_days" in raw_settings:
+            migrated = raw_settings
+        elif "initial_balance" in raw_settings or "start_date" in raw_settings:
+            migrated = migrate_previous_settings(raw_settings, None)
+        else:
+            continue
+        try:
+            balance_date = balance_date_value(migrated.get("balance_date"), date.today())
+            settings = normalize_settings(migrated, fallback_balance_date=balance_date, override_balance_date=balance_date)
+        except ValueError:
+            continue
+        settings["events_text"] = str(raw_settings.get("events_text", ""))
+        history.append(
+            {
+                "created_at": created_at,
+                "settings": settings,
+                "summary": {
+                    "active_mode": str(raw_summary.get("active_mode", settings["active_mode"])),
+                    "current_final_balance": round_money(raw_summary.get("current_final_balance", 0)),
+                    "base_final_balance": round_money(raw_summary.get("base_final_balance", 0)),
+                    "shock_day": raw_summary.get("shock_day"),
+                },
+            }
+        )
+    return history[:HISTORY_LIMIT]
+
+
+def build_horizon(settings: dict[str, Any]) -> list[date]:
+    start = as_date(settings["balance_date"], "balance_date")
+    return [start + timedelta(days=index) for index in range(settings["forecast_days"])]
+
+
+def run_scenario(settings: dict[str, Any], events: list[dict[str, Any]], mode_key: str, *, shock_day: int | None = None) -> dict[str, Any]:
+    horizon = build_horizon(settings)
+    config = MODE_CONFIG[mode_key]
+    income_date = as_date(settings["next_income_date"], "next_income_date")
+    income_amount = settings["next_income_amount"]
+    required_percent = required_percent_for_mode(settings, mode_key)
+    savings_target = savings_target_amount(settings, use_savings=config["use_savings"])
+    waterline = waterline_amount(settings)
+    end_date = as_date(settings["end_date"], "end_date")
+
+    event_map: dict[str, list[dict[str, Any]]] = {}
+    for event in events:
+        event_map.setdefault(event["date"], []).append(event)
+    daily_events: list[list[dict[str, Any]]] = []
+    event_totals: list[float] = []
+    for current_day in horizon:
+        items = event_map.get(current_day.isoformat(), [])
+        daily_events.append(items)
+        event_totals.append(round_money(sum(item["amount"] for item in items)))
+    remaining_event_costs = [0.0] * (len(horizon) + 1)
+    for index in range(len(horizon) - 1, -1, -1):
+        remaining_event_costs[index] = round_money(remaining_event_costs[index + 1] + event_totals[index])
+
+    income_day_index = None
+    if horizon and horizon[0] <= income_date <= end_date:
+        income_day_index = (income_date - horizon[0]).days
+
+    current_balance = settings["current_balance"]
+    cycle_floor = round_money(max(current_balance, 0.0) * settings["free_money_percent"] / 100)
+    free_money_bucket = cycle_floor
+    rows: list[dict[str, Any]] = []
+
+    for index, current_day in enumerate(horizon):
+        remaining_days = len(horizon) - index
+        future_income = income_amount if income_day_index is not None and income_day_index >= index else 0.0
+        safe_limit = max((current_balance + future_income - savings_target - remaining_event_costs[index]) / remaining_days, 0.0)
+        safe_limit = round_money(safe_limit)
+        income_received = income_amount if income_day_index == index else 0.0
+        spendable_balance = round_money(current_balance + income_received)
+        required_spend = round_money(spendable_balance * required_percent / 100)
+        event_total = event_totals[index]
+        balance_after_spend = round_money(spendable_balance - required_spend - event_total)
+        shock_loss = 0.0
+        if config["shock"] and shock_day == index + 1:
+            shock_loss = round_money(max(balance_after_spend, 0.0) * 0.2)
+        balance_end = round_money(balance_after_spend - shock_loss)
+        total_spend = round_money(required_spend + event_total + shock_loss)
+        free_money_reset = total_spend > 0.0
+        free_money_accrued = 0.0
+        if free_money_reset:
+            cycle_floor = round_money(max(balance_end, 0.0) * settings["free_money_percent"] / 100)
+            free_money_bucket = cycle_floor
+        else:
+            free_money_accrued = cycle_floor
+            free_money_bucket = round_money(free_money_bucket + cycle_floor)
+        total_assets = round_money(balance_end + free_money_bucket)
+        rows.append(
+            {
+                "day": index + 1,
+                "date": current_day.isoformat(),
+                "income": income_received,
+                "events": event_total,
+                "event_names": [item["name"] for item in daily_events[index]],
+                "safe_limit": safe_limit,
+                "required_spend": required_spend,
+                "total_spend": total_spend,
+                "balance_start": round_money(current_balance),
+                "balance_end": balance_end,
+                "free_money_bucket": free_money_bucket,
+                "free_money_floor": cycle_floor,
+                "free_money_accrued": free_money_accrued,
+                "free_money_reset": free_money_reset,
+                "total_assets": total_assets,
+                "below_waterline": total_assets <= waterline + 0.009,
+                "stress_triggered": shock_loss > 0.0,
+                "shock_loss": shock_loss,
+            }
+        )
+        current_balance = balance_end
+
+    waterline_day = next((row["day"] for row in rows if row["below_waterline"]), None)
+    negative_day = next((row["day"] for row in rows if row["balance_end"] < 0.0), None)
+    income_day = income_day_index + 1 if income_day_index is not None else None
+    return {
+        "key": mode_key,
+        "label": MODE_LABELS[mode_key],
+        "days": rows,
+        "summary": {
+            "final_balance": rows[-1]["balance_end"] if rows else round_money(settings["current_balance"]),
+            "final_total_assets": rows[-1]["total_assets"] if rows else round_money(settings["current_balance"]),
+            "final_free_money_bucket": rows[-1]["free_money_bucket"] if rows else 0.0,
+            "tightest_safe_limit": round_money(min((row["safe_limit"] for row in rows), default=0.0)),
+            "highest_required_spend": round_money(max((row["required_spend"] for row in rows), default=0.0)),
+            "lowest_total_assets": round_money(min((row["total_assets"] for row in rows), default=settings["current_balance"])),
+            "income_day": income_day,
+            "waterline_day": waterline_day,
+            "negative_day": negative_day,
+            "shock_day": shock_day if config["shock"] else None,
+            "savings_target_amount": savings_target,
+            "required_expense_percent": required_percent,
+            "free_money_percent": settings["free_money_percent"],
+            "base_safe_limit": rows[0]["safe_limit"] if rows else 0.0,
+            "waterline_amount": waterline,
+        },
+    }
+
+
+def canonical_active_mode(settings: dict[str, Any]) -> str:
+    return normalize_active_mode(settings.get("active_mode"), settings.get("visible_modes", {}))
+
+
+def build_table(settings: dict[str, Any], scenarios: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    active_mode = canonical_active_mode(settings)
+    table: list[dict[str, Any]] = []
+    for index, base_row in enumerate(scenarios["base"]["days"]):
+        mode_values = {mode: scenarios[mode]["days"][index]["total_assets"] for mode in MODE_ORDER}
+        below_waterline = {mode: scenarios[mode]["days"][index]["below_waterline"] for mode in MODE_ORDER}
+        table.append(
+            {
+                "day": base_row["day"],
+                "date": base_row["date"],
+                "income": base_row["income"],
+                "events": base_row["events"],
+                "event_names": base_row["event_names"],
+                "modes": mode_values,
+                "below_waterline": below_waterline,
+                "current": mode_values[active_mode],
+                "current_below_waterline": below_waterline[active_mode],
+                "stress_triggered": scenarios[active_mode]["days"][index]["stress_triggered"],
+            }
+        )
+    return table
+
+
+def build_chart_data(settings: dict[str, Any], scenarios: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    active_mode = canonical_active_mode(settings)
+    labels = [row["date"] for row in scenarios["base"]["days"]]
+    return {
+        "labels": labels,
+        "modes": {mode: [row["total_assets"] for row in scenarios[mode]["days"]] for mode in MODE_ORDER},
+        "current": [row["total_assets"] for row in scenarios[active_mode]["days"]],
+        "waterline": [waterline_amount(settings) for _ in labels],
+        "active_mode": active_mode,
+        "visible_modes": settings["visible_modes"],
+    }
+
+
+def build_response(document: dict[str, Any]) -> dict[str, Any]:
+    settings = dict(document["settings"])
+    settings["active_mode"] = canonical_active_mode(settings)
+    settings["end_date"] = derive_end_date(as_date(settings["balance_date"], "balance_date"), settings["forecast_days"]).isoformat()
+    settings["events_text"] = events_to_text(document["events"])
+    settings["resource_within_horizon"] = resource_within_horizon(settings)
+    settings["waterline_amount"] = waterline_amount(settings)
+    settings["savings_target_amount"] = savings_target_amount(settings, use_savings=True)
+    settings["base_safe_limit"] = document["scenarios"]["base"]["summary"]["base_safe_limit"]
+    return {
+        "settings": settings,
+        "events": document["events"],
+        "history": document["history"],
+        "scenarios": document["scenarios"],
+        "table": build_table(settings, document["scenarios"]),
+        "chart_data": build_chart_data(settings, document["scenarios"]),
+        "meta": {
+            "mode_order": list(MODE_ORDER),
+            "mode_labels": MODE_LABELS,
+            "visible_keys": [mode for mode in MODE_ORDER if settings["visible_modes"].get(mode)],
+            "active_mode": settings["active_mode"],
+        },
+    }
+
+
+def build_document(settings: dict[str, Any], events: list[dict[str, Any]], history: list[dict[str, Any]], *, shock_day: int | None = None) -> dict[str, Any]:
+    if shock_day is None or not isinstance(shock_day, int) or not (1 <= shock_day <= settings["forecast_days"]):
+        shock_day = random.randint(1, settings["forecast_days"])
+    settings = dict(settings)
+    settings["active_mode"] = canonical_active_mode(settings)
+    scenarios = {
+        mode: run_scenario(settings, events, mode, shock_day=shock_day if MODE_CONFIG[mode]["shock"] else None)
+        for mode in MODE_ORDER
+    }
+    return {"settings": settings, "events": events, "history": history[:HISTORY_LIMIT], "scenarios": scenarios}
+
+
+def snapshot_entry(document: dict[str, Any]) -> dict[str, Any]:
+    active_mode = canonical_active_mode(document["settings"])
+    snapshot_settings = dict(document["settings"])
+    snapshot_settings["events_text"] = events_to_text(document["events"])
+    return {
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "settings": snapshot_settings,
+        "summary": {
+            "active_mode": active_mode,
+            "current_final_balance": document["scenarios"][active_mode]["summary"]["final_total_assets"],
+            "base_final_balance": document["scenarios"]["base"]["summary"]["final_total_assets"],
+            "shock_day": document["scenarios"]["force_majeure"]["summary"]["shock_day"],
+        },
+    }
+
+
+def normalize_current_document(raw_document: dict[str, Any]) -> dict[str, Any] | None:
+    if not isinstance(raw_document, dict):
+        return None
+    raw_settings = raw_document.get("settings")
+    if not isinstance(raw_settings, dict):
+        return None
+    if "current_balance" not in raw_settings and "forecast_days" not in raw_settings:
+        return None
+    balance_date = balance_date_value(raw_settings.get("balance_date"), date.today())
+    settings = normalize_settings(raw_settings, fallback_balance_date=balance_date, override_balance_date=balance_date)
+    events = normalize_events(raw_document.get("events", []), balance_date)
+    history = normalize_history(raw_document.get("history", []))
+    saved_shock_day = raw_document.get("scenarios", {}).get("force_majeure", {}).get("summary", {}).get("shock_day")
+    return build_document(settings, events, history, shock_day=saved_shock_day)
+
+
+def migrate_previous_document(raw_document: dict[str, Any]) -> dict[str, Any] | None:
+    if not isinstance(raw_document, dict):
+        return None
+    raw_settings = raw_document.get("settings")
+    if not isinstance(raw_settings, dict):
+        return None
+    if "initial_balance" not in raw_settings and "start_date" not in raw_settings:
+        return None
+    migrated = migrate_previous_settings(raw_settings, raw_document.get("scenarios"))
+    balance_date = balance_date_value(migrated.get("balance_date"), date.today())
+    settings = normalize_settings(migrated, fallback_balance_date=balance_date, override_balance_date=balance_date)
+    events = normalize_events(raw_document.get("events", []), balance_date)
+    history = normalize_history(raw_document.get("history", []))
+    saved_shock_day = raw_document.get("scenarios", {}).get("force_majeure", {}).get("summary", {}).get("shock_day")
+    return build_document(settings, events, history, shock_day=saved_shock_day)
+
+
+def migrate_legacy_document() -> dict[str, Any] | None:
+    raw_budget = read_json(LEGACY_BUDGET_FILE)
+    if not isinstance(raw_budget, dict):
+        return None
+    migrated = migrate_legacy_budget(raw_budget)
+    balance_date = balance_date_value(migrated.get("balance_date"), date.today())
+    settings = normalize_settings(migrated, fallback_balance_date=balance_date, override_balance_date=balance_date)
+    events = normalize_events(raw_budget.get("events_text", ""), balance_date)
+    history = normalize_history(read_json(LEGACY_HISTORY_FILE))
+    return build_document(settings, events, history)
+
+
+def load_document() -> dict[str, Any]:
+    current = read_json(BUDGET_FILE, backup_invalid=True)
+    normalized = normalize_current_document(current)
+    if normalized is not None:
+        write_json(BUDGET_FILE, normalized)
+        return normalized
+    migrated_previous = migrate_previous_document(current)
+    if migrated_previous is not None:
+        write_json(BUDGET_FILE, migrated_previous)
+        return migrated_previous
+    migrated_legacy = migrate_legacy_document()
+    if migrated_legacy is not None:
+        write_json(BUDGET_FILE, migrated_legacy)
+        return migrated_legacy
+    today = date.today()
+    settings = normalize_settings(default_settings(today), fallback_balance_date=today, override_balance_date=today)
+    document = build_document(settings, [], [])
+    write_json(BUDGET_FILE, document)
+    return document
+
+
+def calculate_document(payload: dict[str, Any], history: list[dict[str, Any]]) -> dict[str, Any]:
+    today = date.today()
+    settings = normalize_settings(payload, fallback_balance_date=today, override_balance_date=today)
+    events = normalize_events(payload.get("events_text", ""), today)
+    normalized_history = normalize_history(history)
+    document = build_document(settings, events, normalized_history)
+    if as_bool(payload.get("save_history", True)):
+        normalized_history.insert(0, snapshot_entry(document))
+        document["history"] = normalized_history[:HISTORY_LIMIT]
+    return document
+
+
+def api_error(message: str, status_code: int = 400):
+    return jsonify({"error": message}), status_code
+
+
+@app.errorhandler(Exception)
+def handle_unexpected_error(error: Exception):
+    if isinstance(error, HTTPException):
+        return error
+    if request.path in {"/load", "/calculate", "/reset"}:
+        return api_error("Внутрішня помилка сервера.", 500)
+    raise error
 
 
 @app.get("/")
@@ -736,40 +740,32 @@ def index() -> str:
     return render_template("index.html")
 
 
-@app.get("/state")
-def state() -> Any:
-    budget_payload = _read_budget()
-    history = _read_history()
-
-    try:
-        data = _parse_request(budget_payload)
-    except ValueError:
-        return jsonify({"budget": DEFAULT_BUDGET, "history": history, "forecast": None})
-
-    return jsonify(
-        {
-            "budget": budget_payload,
-            "history": history,
-            "forecast": _build_response(data, history),
-        }
-    )
-
-
-@app.delete("/history")
-def clear_history() -> Any:
-    return jsonify({"history": _write_history([])})
+@app.get("/load")
+def load_route():
+    return jsonify(build_response(load_document()))
 
 
 @app.post("/calculate")
-def calculate() -> tuple[Any, int] | Any:
-    payload = request.get_json(silent=True) or {}
-
+def calculate_route():
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return api_error("Очікувався JSON з параметрами прогнозу.")
     try:
-        data = _parse_request(payload)
-        save_history = _to_bool(payload.get("save_history"), default=True)
-        return jsonify(build_forecast(data, save_history=save_history))
-    except ValueError as exc:
-        return jsonify({"error": str(exc)}), 400
+        current_document = load_document()
+        document = calculate_document(payload, current_document.get("history", []))
+        write_json(BUDGET_FILE, document)
+    except ValueError as error:
+        return api_error(str(error))
+    return jsonify(build_response(document))
+
+
+@app.post("/reset")
+def reset_route():
+    today = date.today()
+    settings = normalize_settings(default_settings(today), fallback_balance_date=today, override_balance_date=today)
+    document = build_document(settings, [], [])
+    write_json(BUDGET_FILE, document)
+    return jsonify(build_response(document))
 
 
 if __name__ == "__main__":

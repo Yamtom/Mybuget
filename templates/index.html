@@ -3,228 +3,203 @@
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>MyBudget | Денний прогноз ресурсу</title>
+    <title>Budget Horizon</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
 </head>
 <body>
-    <div class="background-shape shape-1"></div>
-    <div class="background-shape shape-2"></div>
-    <div class="background-grid"></div>
+    <div class="page-glow glow-left"></div>
+    <div class="page-glow glow-right"></div>
 
     <main class="layout">
-        <section class="hero">
-            <p class="eyebrow">Прогноз бюджету по днях</p>
-            <h1>Покажи старт, дохід, резерв і вільні гроші, а система розріже місяць на виживання по днях.</h1>
-            <p class="subtitle">
-                Модель враховує наявний бюджет, ймовірну дату наступного доходу, відсоток цільового резерву,
-                щоденні витрати, вільні гроші і точкові удари по бюджету. На виході ви бачите коридор між
-                економним та агресивним сценаріями, день входу у резерв і найтіснішу пайку.
+        <section class="hero panel">
+            <p class="eyebrow">Budget Horizon</p>
+            <h1>Поточний баланс, режими витрат і запас міцності на весь період.</h1>
+            <p class="hero-copy">
+                Система бере поточний баланс на дату введення, прогнозує горизонт у днях, рахує ціль збереження у відсотках,
+                необхідні витрати, вільні гроші та показує 4 режими. Ви самі вирішуєте, які з них видимі і який режим є активним для Current.
             </p>
-            <div class="hero-ribbon">
-                <span>Дата доходу</span>
-                <span>Резерв у %</span>
-                <span>Вільні гроші</span>
-                <span>Коридор виживання</span>
-            </div>
         </section>
 
         <section class="panel input-panel">
             <div class="section-head">
                 <div>
-                    <h2>Вхідні дані</h2>
-                    <p>Останній розрахунок зберігається в <code>budget.json</code> і підтягується при відкритті сторінки.</p>
+                    <h2>Параметри</h2>
+                    <p>Збереження і сценарії живуть в одному <code>budget.json</code>.</p>
                 </div>
             </div>
 
             <form id="calc-form" class="form-grid">
                 <label>
-                    Наявний бюджет
-                    <input type="number" step="0.01" min="0" name="available_budget" value="24000" required />
+                    Поточний баланс
+                    <input type="number" step="0.01" min="0" name="current_balance" required />
                 </label>
                 <label>
-                    Вільні гроші
-                    <input type="number" step="0.01" min="0" name="free_money" value="4500" required />
+                    Дата введення балансу
+                    <input type="text" id="balance-date-display" value="-" disabled />
                 </label>
                 <label>
-                    Наступний дохід
-                    <input type="number" step="0.01" min="0" name="next_income_amount" value="18000" required />
+                    Період прогнозування, днів
+                    <input type="number" min="1" max="365" name="forecast_days" required />
                 </label>
                 <label>
-                    Ймовірна дата доходу
+                    Дата кінця прогнозу
+                    <input type="text" id="end-date-display" value="-" disabled />
+                </label>
+                <label>
+                    Дата наступного доходу
                     <input type="date" name="next_income_date" required />
                 </label>
                 <label>
-                    Ціль збереження, % на місяць
-                    <input type="number" step="0.01" min="0" max="100" name="monthly_savings_percent" value="18" required />
+                    Наступний дохід
+                    <input type="number" step="0.01" min="0" name="next_income_amount" required />
                 </label>
                 <label>
-                    Щоденні витрати
-                    <input type="number" step="0.01" min="0" name="daily_expense" value="850" required />
+                    Ціль збереження, %
+                    <input type="number" step="0.01" min="0" max="100" name="savings_goal_percent" required />
                 </label>
-                <label class="field-span-2">
-                    Горизонт прогнозу, днів
-                    <input type="number" min="7" max="180" name="days" value="30" required />
+                <label>
+                    Необхідні витрати, % на день
+                    <input type="number" step="0.01" min="0" max="100" name="required_expense_percent" required />
                 </label>
-                <label class="field-span-2">
-                    Точкові витрати
-                    <textarea
-                        name="events_text"
-                        rows="5"
-                        placeholder="6;1400;Ліки&#10;13;3200;Ремонт&#10;24;1800;Свято"
-                    >6;1400;Ліки
-13;3200;Ремонт
-24;1800;Свято</textarea>
+                <label>
+                    Вільні гроші, %
+                    <input type="number" step="0.01" min="0" max="100" name="free_money_percent" required />
+                </label>
+                <label>
+                    Ватерлінія, %
+                    <input type="number" step="0.01" min="0" max="100" name="waterline_percent" required />
                 </label>
 
-                <button type="submit" class="cta">Порахувати сценарії</button>
+                <div class="field-span-2 mode-panel">
+                    <div class="mode-panel-head">
+                        <h3>Режими</h3>
+                        <p>Чекбокс керує видимістю, радіокнопка визначає активний Current.</p>
+                    </div>
+                    <div class="mode-grid">
+                        <label class="mode-row">
+                            <input type="checkbox" name="visible_base" />
+                            <span>Показувати базовий</span>
+                            <input type="radio" name="active_mode" value="base" />
+                            <strong>Current = Базовий</strong>
+                        </label>
+                        <label class="mode-row">
+                            <input type="checkbox" name="visible_economy" />
+                            <span>Показувати економний</span>
+                            <input type="radio" name="active_mode" value="economy" />
+                            <strong>Current = Економний</strong>
+                        </label>
+                        <label class="mode-row">
+                            <input type="checkbox" name="visible_aggressive" />
+                            <span>Показувати агресивний</span>
+                            <input type="radio" name="active_mode" value="aggressive" />
+                            <strong>Current = Агресивний</strong>
+                        </label>
+                        <label class="mode-row">
+                            <input type="checkbox" name="visible_force_majeure" />
+                            <span>Показувати форс-мажор</span>
+                            <input type="radio" name="active_mode" value="force_majeure" />
+                            <strong>Current = Форс-мажор</strong>
+                        </label>
+                    </div>
+                </div>
+
+                <label class="field-span-2">
+                    Події
+                    <textarea
+                        name="events_text"
+                        rows="6"
+                        placeholder="2026-03-25;ТО авто;4500&#10;2026-04-10;Ліки;1200"
+                    ></textarea>
+                </label>
+
+                <div class="button-row field-span-2">
+                    <button type="submit" class="cta">Порахувати</button>
+                    <button type="button" id="reset-button" class="ghost-button">Скинути все</button>
+                </div>
             </form>
 
             <ul class="micro-notes">
-                <li>Ціль збереження рахується як відсоток від ресурсу в межах горизонту: старт плюс дохід, якщо він встигає зайти.</li>
-                <li>Вільні гроші працюють як подушка: модель фіксує день, коли операційний бюджет уже починає їх їсти.</li>
-                <li>Формат події: <code>день;сума;назва</code> або <code>день|сума|назва</code>.</li>
+                <li>Дата старту більше не редагується: це дата введення поточного балансу.</li>
+                <li>Вільні гроші накопичуються тільки в день без витрат; після витрати цикл починається заново з мінімального значення.</li>
+                <li>Якщо приховати активний режим, бекенд автоматично переключить Current на перший видимий.</li>
             </ul>
 
             <p id="form-error" class="error" aria-live="polite"></p>
         </section>
 
-        <section class="panel overview-panel">
+        <section class="panel summary-panel">
             <div class="section-head">
                 <div>
-                    <h2>Активний сценарій</h2>
-                    <p id="scenario-name">Базовий режим</p>
+                    <h2>Контрольні точки</h2>
+                    <p id="summary-caption">Після розрахунку тут з'явиться стан активного режиму.</p>
                 </div>
-                <div id="corridor-state" class="status-pill">Чекає на розрахунок</div>
+                <span id="mode-pill" class="pill">Current</span>
             </div>
-
-            <p id="selected-scenario-note" class="scenario-note">
-                Після розрахунку тут з’явиться короткий висновок по запасу міцності, резерву та денній пайці.
-            </p>
 
             <div class="metrics">
                 <article>
-                    <h3>Ресурс на фініші</h3>
-                    <p id="final-total-assets">-</p>
+                    <span>Безпечний ліміт</span>
+                    <strong id="base-safe-limit">-</strong>
                 </article>
                 <article>
-                    <h3>Вільні гроші</h3>
-                    <p id="final-free-money">-</p>
+                    <span>Ціль збереження</span>
+                    <strong id="savings-target-amount">-</strong>
                 </article>
                 <article>
-                    <h3>Цільовий резерв</h3>
-                    <p id="target-reserve">-</p>
+                    <span>Ватерлінія</span>
+                    <strong id="waterline-amount">-</strong>
                 </article>
                 <article>
-                    <h3>Найтужча пайка</h3>
-                    <p id="tightest-limit">-</p>
+                    <span>Ресурс у горизонті</span>
+                    <strong id="resource-amount">-</strong>
                 </article>
             </div>
 
-            <div class="corridor-card">
-                <strong>Орієнтир по доходу і коридору</strong>
-                <p id="income-caption">
-                    Після розрахунку тут буде видно, на який день очікується дохід і чи допомагає він втримати коридор.
-                </p>
-                <p id="corridor-caption">
-                    Якщо активний сценарій виходить за коридор між економним та агресивним режимами, це окремий сигнал ризику.
-                </p>
-            </div>
-
-            <div class="section-head compact-head">
-                <div>
-                    <h3>Календар подій</h3>
-                </div>
-            </div>
-            <div id="event-preview" class="event-preview">
-                <p class="placeholder compact">Події з’являться після розрахунку.</p>
-            </div>
-        </section>
-
-        <section class="panel scenarios-panel">
-            <div class="section-head">
-                <div>
-                    <h2>Сценарії</h2>
-                    <p>Клік по картці перемикає графік, таблицю та критичні точки.</p>
-                </div>
-            </div>
-            <div id="scenario-cards" class="scenario-grid">
-                <p class="placeholder compact">Після розрахунку тут з’являться чотири сценарії.</p>
-            </div>
-        </section>
-
-        <section class="panel insights-panel">
-            <div class="section-head">
-                <div>
-                    <h2>Критичні точки</h2>
-                    <p>Доход, стискання пайки, початок використання вільних грошей, ватерлінія і мінус.</p>
-                </div>
-            </div>
-            <div id="critical-points" class="points-list">
-                <p class="placeholder compact">Критичні точки з’являться після розрахунку.</p>
-            </div>
-        </section>
-
-        <section class="panel history-panel">
-            <div class="section-head section-head-wide">
-                <div>
-                    <h2>Історія</h2>
-                    <p>Кожен ручний запуск пишеться в <code>history.json</code>. Запис можна відкрити без дубля в історії.</p>
-                </div>
-                <button type="button" id="clear-history" class="ghost-button">Очистити історію</button>
-            </div>
-            <div id="history-list" class="history-list">
-                <p class="placeholder compact">Історія поки порожня.</p>
-            </div>
+            <div id="scenario-strip" class="scenario-strip"></div>
         </section>
 
         <section class="panel chart-panel">
-            <div class="section-head section-head-wide">
+            <div class="section-head">
                 <div>
-                    <h2>Коридор ресурсу</h2>
-                    <p id="chart-caption">Графік побудує коридор між економним та агресивним сценаріями і покаже ватерлінію.</p>
-                </div>
-                <div class="legend">
-                    <span><i class="legend-swatch corridor"></i> Коридор</span>
-                    <span><i class="legend-swatch balance"></i> Активний сценарій</span>
-                    <span><i class="legend-swatch income"></i> Дохід</span>
-                    <span><i class="legend-swatch waterline"></i> Ватерлінія</span>
+                    <h2>Сценарії</h2>
+                    <p>На графіку видно тільки вибрані режими, окремо Current і ватерлінію.</p>
                 </div>
             </div>
-            <div id="balance-chart" class="chart-shell">
-                <p class="placeholder">Графік з’явиться після першого розрахунку.</p>
+            <div class="chart-shell">
+                <canvas id="forecast-chart" aria-label="Графік бюджетних сценаріїв"></canvas>
             </div>
         </section>
 
         <section class="panel table-panel">
             <div class="section-head">
                 <div>
-                    <h2>Поденна деталізація</h2>
-                    <p>Таблиця показує реальний ресурс, резервну подушку, дохід, події і день, коли починаєте їсти вільні гроші.</p>
+                    <h2>Таблиця по днях</h2>
+                    <p>Current дублює активний режим, навіть якщо він збігається з видимим сценарієм.</p>
                 </div>
             </div>
-            <div class="table-container">
+
+            <div class="table-shell">
                 <table>
-                    <thead>
-                        <tr>
-                            <th>День</th>
-                            <th>Дата</th>
-                            <th>Старт ресурсу</th>
-                            <th>Ліміт дня</th>
-                            <th>Щоденні</th>
-                            <th>Івенти</th>
-                            <th>Дохід</th>
-                            <th>Форс</th>
-                            <th>З резерву</th>
-                            <th>У вільні</th>
-                            <th>Фініш</th>
-                        </tr>
-                    </thead>
+                    <thead id="projection-head"></thead>
                     <tbody id="projection-body"></tbody>
                 </table>
             </div>
         </section>
+
+        <section class="panel history-panel">
+            <div class="section-head">
+                <div>
+                    <h2>Історія запусків</h2>
+                    <p>Короткі snapshots для повторного відкриття попередніх розрахунків.</p>
+                </div>
+            </div>
+            <div id="history-list" class="history-list">
+                <p class="placeholder">Історія ще порожня.</p>
+            </div>
+        </section>
     </main>
 
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script src="{{ url_for('static', filename='app.js') }}"></script>
 </body>
 </html>
