@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>MyBudget - Інтерактивний калькулятор</title>
+    <title>MyBudget | Денний прогноз ліквідності</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,700;9..144,900&family=Manrope:wght@400;500;700;800&display=swap" rel="stylesheet" />
@@ -12,88 +12,161 @@
 <body>
     <div class="background-shape shape-1"></div>
     <div class="background-shape shape-2"></div>
+    <div class="background-grid"></div>
 
     <main class="layout">
         <section class="hero">
-            <p class="eyebrow">Планування бюджету без хаосу</p>
-            <h1>Інтерактивний калькулятор фінансового прогресу</h1>
-            <p class="subtitle">Вкажіть наявні кошти, витрату та фіксований інтервал списання (типово 31 день). Отримайте поденний прогноз і прогрес розподілу залишку.</p>
+            <p class="eyebrow">Просте денне планування</p>
+            <h1>Вводьте наявні кошти, а система сама покаже, як вони згорають і що встигає піти в накопичення.</h1>
+            <p class="subtitle">
+                Оперативні витрати задаються процентом від поточного доступного залишку. Після щоденної витрати
+                частина решти переходить у накопичення, цей пул росте окремо, а база для нового розрахунку оновлюється.
+            </p>
         </section>
 
         <section class="panel input-panel">
-            <h2>Вхідні дані</h2>
+            <div class="section-head">
+                <div>
+                    <h2>Вхідні дані</h2>
+                    <p>Мінімум полів: наявні кошти, відсоток витрат, відсоток накопичення і горизонт.</p>
+                </div>
+            </div>
+
             <form id="calc-form" class="form-grid">
                 <label>
                     Наявні кошти
-                    <input type="number" step="0.01" min="0" name="current_balance" placeholder="Наприклад: 25000" required />
+                    <input type="number" step="0.01" min="0" name="available_funds" value="30000" required />
                 </label>
                 <label>
-                    К-сть днів прогнозу
-                    <input type="number" min="1" max="3660" name="days" placeholder="Наприклад: 93" required />
+                    Горизонт прогнозу, днів
+                    <input type="number" min="7" max="120" name="days" value="30" required />
                 </label>
                 <label>
-                    Витрата за один цикл
-                    <input type="number" step="0.01" min="0" name="expense_amount" placeholder="Наприклад: 8000" required />
+                    Оперативні витрати, % на день
+                    <input type="number" step="0.01" min="0" max="100" name="operating_percent" value="4.5" required />
                 </label>
                 <label>
-                    Інтервал витрати (днів)
-                    <input type="number" min="1" name="expense_interval_days" placeholder="31" required />
-                </label>
-                <label>
-                    Частка зайвих коштів (%)
-                    <input type="number" step="0.01" min="0" max="100" name="extra_percent" placeholder="Наприклад: 30" required />
-                </label>
-                <label>
-                    Частка збережень (%)
-                    <input type="number" step="0.01" min="0" max="100" name="savings_percent" placeholder="Наприклад: 40" required />
+                    У накопичення після витрати, %
+                    <input type="number" step="0.01" min="0" max="100" name="extra_percent" value="18" required />
                 </label>
 
-                <button type="submit" class="cta">Розрахувати прогноз</button>
+                <button type="submit" class="cta">Порахувати</button>
             </form>
+
+            <ul class="micro-notes">
+                <li>Оперативна витрата береться від поточного ліквідного залишку, а не фіксованою сумою.</li>
+                <li>Накопичення росте окремо і не підмішується назад у щоденну ліквідність.</li>
+                <li>Історія запусків зберігається між перезавантаженнями сторінки.</li>
+            </ul>
+
             <p id="form-error" class="error" aria-live="polite"></p>
         </section>
 
-        <section class="panel result-panel">
-            <h2>Ключові показники</h2>
-            <div class="metrics" id="metrics">
-                <article>
-                    <h3>Фінальний баланс</h3>
-                    <p id="final-balance">-</p>
-                </article>
-                <article>
-                    <h3>Загальні збереження</h3>
-                    <p id="total-savings">-</p>
-                </article>
-                <article>
-                    <h3>Загальні витрати</h3>
-                    <p id="total-operational">-</p>
-                </article>
-                <article>
-                    <h3>Індекс накопичення</h3>
-                    <p id="stability-index">-</p>
-                </article>
+        <section class="panel overview-panel">
+            <div class="section-head">
+                <div>
+                    <h2>Активний сценарій</h2>
+                    <p id="scenario-name">Оберіть або порахуйте сценарій</p>
+                </div>
             </div>
 
-            <div class="progress-wrap">
-                <p>Прогрес накопичень</p>
-                <div id="progress-bars" class="bars"></div>
+            <p id="selected-scenario-note" class="scenario-note">
+                Після розрахунку тут з'явиться короткий висновок по ліквідності й накопиченню.
+            </p>
+
+            <div class="metrics">
+                <article>
+                    <h3>Ліквідність на фініші</h3>
+                    <p id="final-liquid">-</p>
+                </article>
+                <article>
+                    <h3>Накопичено зайвих</h3>
+                    <p id="extra-pool">-</p>
+                </article>
+                <article>
+                    <h3>Сумарний капітал</h3>
+                    <p id="total-assets">-</p>
+                </article>
+                <article>
+                    <h3>Найтісніший safe pace</h3>
+                    <p id="safe-limit">-</p>
+                </article>
+            </div>
+        </section>
+
+        <section class="panel history-panel">
+            <div class="section-head section-head-wide">
+                <div>
+                    <h2>Історія</h2>
+                    <p>Кожен розрахунок зберігається. Можна повернутись до будь-якого вводу.</p>
+                </div>
+                <button type="button" id="clear-history" class="ghost-button">Очистити історію</button>
+            </div>
+            <div id="history-list" class="history-list">
+                <p class="placeholder">Історія поки порожня.</p>
+            </div>
+        </section>
+
+        <section class="panel scenarios-panel">
+            <div class="section-head">
+                <div>
+                    <h2>Сценарії</h2>
+                    <p>Один і той самий стартовий капітал можна прогнати в різних режимах витрат і накопичення.</p>
+                </div>
+            </div>
+            <div id="scenario-cards" class="scenario-grid">
+                <p class="placeholder">Після розрахунку тут з'являться картки сценаріїв.</p>
+            </div>
+        </section>
+
+        <section class="panel insights-panel">
+            <div class="section-head">
+                <div>
+                    <h2>Критичні точки</h2>
+                    <p>Події, де баланс стає напруженим або ліквідність закінчується.</p>
+                </div>
+            </div>
+            <div id="critical-points" class="points-list">
+                <p class="placeholder">Тут з'являться ключові події сценарію.</p>
+            </div>
+        </section>
+
+        <section class="panel chart-panel">
+            <div class="section-head section-head-wide">
+                <div>
+                    <h2>Динаміка ліквідності</h2>
+                    <p id="chart-caption">Після розрахунку графік покаже падіння доступного залишку по днях.</p>
+                </div>
+                <div class="legend">
+                    <span><i class="legend-swatch balance"></i> Ліквідність</span>
+                    <span><i class="legend-swatch zero"></i> Нульова лінія</span>
+                </div>
+            </div>
+            <div id="balance-chart" class="chart-shell">
+                <p class="placeholder">Графік буде побудований тут.</p>
             </div>
         </section>
 
         <section class="panel table-panel">
-            <h2>Поденний розрахунок</h2>
+            <div class="section-head">
+                <div>
+                    <h2>Поденна деталізація</h2>
+                    <p>Таблиця завжди відображає активний сценарій.</p>
+                </div>
+            </div>
             <div class="table-container">
                 <table>
                     <thead>
                         <tr>
                             <th>День</th>
-                            <th>Початок</th>
-                            <th>Витрата</th>
-                            <th>Залишок після витрати</th>
-                            <th>Зайві кошти</th>
-                            <th>Збереження</th>
-                            <th>Вільний залишок</th>
-                            <th>Прогрес збережень</th>
+                            <th>Старт ліквідності</th>
+                            <th>Опер. %</th>
+                            <th>Опер. витрата</th>
+                            <th>Форс-мажор</th>
+                            <th>У накопичення</th>
+                            <th>Фініш ліквідності</th>
+                            <th>Накопичено</th>
+                            <th>Safe pace</th>
                         </tr>
                     </thead>
                     <tbody id="projection-body"></tbody>
