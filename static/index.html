@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Budget Horizon — Налаштування</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="container">
+    <header class="page-header">
+      <h1>Budget Horizon</h1>
+      <p class="subtitle">Прогноз на основі наявного балансу та історії його змін</p>
+    </header>
+
+    <form id="form" class="card">
+      <div class="form-grid">
+        <div class="field">
+          <label for="available_balance">Наявний баланс на момент вводу (₴)</label>
+          <input type="number" id="available_balance" name="available_balance" min="0.01" step="0.01" required />
+        </div>
+        <div class="field">
+          <label for="new_balance">Новий баланс для додавання в історію (₴)</label>
+          <input type="number" id="new_balance" name="new_balance" min="0.01" step="0.01" placeholder="Наприклад 11800" />
+        </div>
+        <div class="field">
+          <label for="date_start">Дата старту</label>
+          <input type="date" id="date_start" name="date_start" required />
+        </div>
+        <div class="field">
+          <label for="date_end">Дата кінця</label>
+          <input type="date" id="date_end" name="date_end" required />
+        </div>
+        <div class="field">
+          <label for="save_days">Кількість днів заощадження</label>
+          <input type="number" id="save_days" name="save_days" min="1" max="365" required />
+        </div>
+        <div class="field">
+          <label for="savings_percent">Заощадження, % (за період)</label>
+          <input type="number" id="savings_percent" name="savings_percent" min="0" max="100" step="0.01" required />
+        </div>
+        <div class="field">
+          <label for="required_expense_percent">Необхідні витрати, % (щодня)</label>
+          <input type="number" id="required_expense_percent" name="required_expense_percent" min="0" max="100" step="0.01" required />
+        </div>
+        <div class="field">
+          <label for="free_money_percent">Вільні гроші, % (щодня)</label>
+          <input type="number" id="free_money_percent" name="free_money_percent" min="0" max="100" step="0.01" required />
+        </div>
+        <div class="field">
+          <label for="waterline_percent">Ватерлінія, % від наявного балансу</label>
+          <input type="number" id="waterline_percent" name="waterline_percent" min="0" max="100" step="0.01" value="10" required />
+        </div>
+      </div>
+
+      <div class="history-panel">
+        <div class="history-panel-head">
+          <h2 class="section-title">Історія балансів</h2>
+          <div class="history-actions">
+            <button type="button" id="add-row" class="btn btn-secondary">+ Додати рядок</button>
+            <button type="button" id="add-new-balance" class="btn btn-primary">+ Додати новий баланс</button>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Дата</th>
+                <th>Баланс</th>
+                <th>Дія</th>
+              </tr>
+            </thead>
+            <tbody id="history-body"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <p id="error" class="error" role="alert"></p>
+
+      <div class="form-actions">
+        <button type="submit" class="btn btn-primary">Розрахувати</button>
+      </div>
+    </form>
+  </div>
+
+  <script>
+    const today = new Date();
+    const pad = n => String(n).padStart(2, "0");
+    const fmtDate = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+
+    const historyBody = document.getElementById("history-body");
+
+    function createHistoryRow(dateValue = "", balanceValue = "") {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td><input class="table-input" type="date" value="${dateValue}" /></td>
+        <td><input class="table-input" type="number" min="0.01" step="0.01" value="${balanceValue}" /></td>
+        <td><button type="button" class="btn btn-danger btn-sm remove-row">Видалити</button></td>
+      `;
+      tr.querySelector(".remove-row").addEventListener("click", () => {
+        tr.remove();
+      });
+      historyBody.appendChild(tr);
+    }
+
+    function readHistoryRows() {
+      const rows = [];
+      for (const tr of historyBody.querySelectorAll("tr")) {
+        const inputs = tr.querySelectorAll("input");
+        const d = (inputs[0].value || "").trim();
+        const b = Number(inputs[1].value);
+        if (!d && !inputs[1].value) continue;
+        if (!d) throw new Error("У таблиці історії відсутня дата.");
+        if (Number.isNaN(b) || b <= 0) throw new Error("У таблиці історії некоректний баланс.");
+        rows.push({ date: d, balance: b });
+      }
+      rows.sort((a, b) => a.date.localeCompare(b.date));
+      return rows;
+    }
+
+    async function autofillFromLastBudget() {
+      try {
+        const res = await fetch("/load");
+        if (!res.ok) return;
+        const doc = await res.json();
+        const s = doc.settings || {};
+
+        if (s.available_balance) document.getElementById("available_balance").value = s.available_balance;
+        if (s.date_start) document.getElementById("date_start").value = s.date_start;
+        if (s.date_end) document.getElementById("date_end").value = s.date_end;
+        if (s.save_days) document.getElementById("save_days").value = s.save_days;
+        if (s.savings_percent !== undefined) document.getElementById("savings_percent").value = s.savings_percent;
+        if (s.required_expense_percent !== undefined) document.getElementById("required_expense_percent").value = s.required_expense_percent;
+        if (s.free_money_percent !== undefined) document.getElementById("free_money_percent").value = s.free_money_percent;
+        if (s.waterline_percent !== undefined) document.getElementById("waterline_percent").value = s.waterline_percent;
+
+        historyBody.innerHTML = "";
+        const history = Array.isArray(s.balance_history) ? s.balance_history : [];
+        if (history.length) {
+          history.forEach(h => createHistoryRow(h.date, h.balance));
+          return;
+        }
+        const fallback = Array.isArray(doc.table) ? doc.table : [];
+        fallback.slice(0, 10).forEach(r => createHistoryRow(r.date, r.balance));
+      } catch {
+        // keep defaults
+      }
+    }
+
+    document.getElementById("add-row").addEventListener("click", () => {
+      createHistoryRow(fmtDate(new Date()), "");
+    });
+
+    document.getElementById("add-new-balance").addEventListener("click", () => {
+      const value = Number(document.getElementById("new_balance").value);
+      const err = document.getElementById("error");
+      err.textContent = "";
+      if (Number.isNaN(value) || value <= 0) {
+        err.textContent = "Вкажіть коректний новий баланс для додавання.";
+        return;
+      }
+      createHistoryRow(fmtDate(new Date()), value.toFixed(2));
+      document.getElementById("new_balance").value = "";
+    });
+
+    document.getElementById("date_start").value = fmtDate(today);
+    const end = new Date(today);
+    end.setDate(end.getDate() + 30);
+    document.getElementById("date_end").value = fmtDate(end);
+    document.getElementById("save_days").value = 30;
+    document.getElementById("savings_percent").value = 20;
+    document.getElementById("required_expense_percent").value = 3;
+    document.getElementById("free_money_percent").value = 5;
+
+    createHistoryRow(fmtDate(today), "");
+    autofillFromLastBudget();
+
+    document.getElementById("form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const err = document.getElementById("error");
+      err.textContent = "";
+
+      const fd = new FormData(e.target);
+      const dateStart = fd.get("date_start");
+      const dateEnd = fd.get("date_end");
+      if (dateEnd < dateStart) {
+        err.textContent = "Дата кінця не може бути раніше дати старту.";
+        return;
+      }
+
+      let balanceHistory = [];
+      try {
+        balanceHistory = readHistoryRows();
+      } catch (ex) {
+        err.textContent = ex.message;
+        return;
+      }
+      if (balanceHistory.length < 1) {
+        err.textContent = "Додайте хоча б один рядок у таблицю історії балансів.";
+        return;
+      }
+
+      const payload = {
+        available_balance: Number(fd.get("available_balance")),
+        date_start: dateStart,
+        date_end: dateEnd,
+        save_days: Number(fd.get("save_days")),
+        savings_percent: Number(fd.get("savings_percent")),
+        required_expense_percent: Number(fd.get("required_expense_percent")),
+        free_money_percent: Number(fd.get("free_money_percent")),
+        waterline_percent: Number(fd.get("waterline_percent")),
+        balance_history: balanceHistory,
+      };
+
+      const btn = e.target.querySelector("button[type=submit]");
+      btn.disabled = true;
+      try {
+        const res = await fetch("/calculate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        if (!res.ok) {
+          const data = await res.json().catch(() => ({}));
+          const detail = data.detail;
+          err.textContent = Array.isArray(detail)
+            ? detail.map(x => x.msg).join("; ")
+            : (detail || "Помилка розрахунку");
+          return;
+        }
+        window.location.href = "/dashboard";
+      } catch {
+        err.textContent = "Сервер недоступний";
+      } finally {
+        btn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>

@@ -1,75 +1,80 @@
-# Budget Horizon
+﻿# Budget Horizon
 
-Локальний Flask-застосунок для денного прогнозування бюджету. Нова модель працює від поточного балансу на дату введення, горизонту в днях, процентної цілі збереження, проценту необхідних витрат, проценту вільних грошей і точкових подій.
-
-## Що рахує
-- `Base`, `Economy`, `Aggressive`, `Force Majeure`
-- `Current` як активний режим
-- безпечний денний ліміт через dynamic reallocation
-- процентні необхідні витрати на день
-- вільні гроші, які накопичуються тільки в дні без витрат і після витрати скидаються до мінімального рівня циклу
-- ватерлінію, критичні просідання і коридор між видимими сценаріями
-
-## Вхідні поля
-- `current_balance` — поточний баланс
-- `balance_date` — дата введення поточного балансу, ставиться автоматично
-- `forecast_days` — період прогнозу в днях
-- `next_income_date` — дата наступного доходу
-- `next_income_amount` — сума наступного доходу
-- `savings_goal_percent` — ціль збереження у відсотках на весь термін
-- `required_expense_percent` — необхідні витрати як денний відсоток
-- `free_money_percent` — відсоток вільних грошей для циклу накопичення
-- `waterline_percent` — ватерлінія від стартового поточного балансу
-- `visible_modes` — які режими показувати
-- `active_mode` — який режим дублюється в `Current`
-- `events_text` — події у форматі `YYYY-MM-DD;Назва;Сума`
-
-Приклад `events_text`:
-
-```text
-2026-03-25;ТО авто;4500
-2026-04-10;Ліки;1200
-2026-04-18;Свято;2000
-```
-
-## Логіка
-- дата старту завжди дорівнює даті введення поточного балансу
-- дата кінця вираховується як `balance_date + forecast_days - 1`
-- ціль збереження = `%` від ресурсу в межах горизонту
-- необхідні витрати = `%` від доступного балансу дня
-- вільні гроші ростуть тільки коли в день не було жодних витрат
-- після витрати вільні гроші повертаються до мінімального значення нового циклу
-
-## Дані
-Єдине джерело правди: `budget.json`
-
-Структура:
-- `settings`
-- `events`
-- `history`
-- `scenarios`
-
-При читанні застосунок:
-- пробує відновити новий `budget.json`
-- мігрує старий формат з попередньої версії
-- робить backup битого JSON у `budget.json.invalid.<timestamp>`
+Мінімалістичний застосунок для накопичувального прогнозування особистого бюджету.
 
 ## Запуск
 
-```powershell
-cd .\Mybuget
-python .\app.py
+```bash
+pip install -r requirements.txt
+uvicorn main:app --reload
+# → http://localhost:8000
 ```
 
-або
+### Спрощений запуск на Windows (рекомендовано)
 
 ```powershell
-cd .\Mybuget
-.\run.bat
+cd C:\Users\grigo\Desktop\Mybuget\Mybuget
+.\.venv\Scripts\python.exe -m uvicorn main:app --reload --host 127.0.0.1 --port 8000
 ```
 
-## Маршрути
-- `GET /` — HTML-інтерфейс
-- `GET /load` — завантаження поточного документа і прогнозу
-- `POST /calculate` — новий розрахунок
-- `POST /reset` — скидання до дефолтних налаштувань
+Відкривати тільки: `http://127.0.0.1:8000`
+
+Якщо бачите `Field required`, найчастіша причина: запущено кілька серверів на різних портах.
+
+Перевірка портів:
+
+```powershell
+Get-NetTCPConnection -LocalPort 8000,8001 -State Listen | Select-Object LocalPort,OwningProcess
+```
+
+Залиште тільки один сервер (8000).
+
+## API
+
+| Метод | URL | Дія |
+| --- | --- | --- |
+| GET | / | Форма введення |
+| GET | /dashboard | Дашборд |
+| GET | /load | Повертає поточний budget.json |
+| POST | /calculate | Рахує один прогноз, зберігає budget.json |
+| POST | /save-table | Зберігає зміни, внесені напряму в таблицю |
+| DELETE | /reset | Видаляє budget.json |
+
+## Вхідні поля
+
+- available_balance: наявний баланс на момент вводу
+- date_start, date_end: період прогнозу
+- save_days: дні, за які треба накопичити ціль
+- savings_percent: відсоток заощадження за період
+- required_expense_percent: щоденні необхідні витрати у %
+- free_money_percent: щоденний % вільних грошей
+- waterline_percent: ватерлінія у % від наявного балансу
+- balance_history[]: історія балансів для глобальної витратної бази
+
+## UX
+
+- Історія балансів автозаповнюється на стартовій формі з останнього `budget.json`.
+- У дашборді можна редагувати значення напряму в таблиці та зберігати кнопкою `Зберегти зміни таблиці`.
+
+## Вихід таблиці
+
+Кожен день містить:
+
+- day
+- date
+- balance
+- required_expense
+- free_money
+
+## Структура
+
+```text
+main.py            # FastAPI маршрути
+models.py          # Pydantic схеми
+calculator.py      # Логіка одного прогнозу
+budget.json        # Стан (auto-generated)
+static/index.html  # Форма введення
+static/dashboard.html  # Дашборд + Chart.js
+static/style.css   # Стилі (responsive >= 768px)
+requirements.txt   # fastapi uvicorn[standard] pydantic
+```

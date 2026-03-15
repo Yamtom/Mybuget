@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Budget Horizon — Дашборд</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+</head>
+<body>
+  <div class="container">
+    <header class="page-header">
+      <div>
+        <h1>Budget Horizon</h1>
+        <p id="sub" class="subtitle">Завантаження...</p>
+      </div>
+      <div class="header-actions">
+        <button id="btn-save-table" class="btn btn-primary">Зберегти зміни таблиці</button>
+        <button id="btn-reset" class="btn btn-danger">Скинути все</button>
+        <a href="/" class="btn btn-secondary">Нове введення</a>
+      </div>
+    </header>
+
+    <div id="warnings"></div>
+
+    <div class="card chart-card">
+      <h2 class="section-title">Прогноз балансу</h2>
+      <div class="chart-wrap"><canvas id="chart"></canvas></div>
+    </div>
+
+    <div class="card">
+      <h2 class="section-title">Таблиця: дата, баланс, необхідні витрати, вільні гроші</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>День</th>
+              <th>Дата</th>
+              <th>Баланс</th>
+              <th>Необхідні витрати</th>
+              <th>Вільні гроші</th>
+            </tr>
+          </thead>
+          <tbody id="tbl"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let chart;
+    let currentRows = [];
+    let currentWaterline = 0;
+    const money = v => v.toLocaleString("uk-UA", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + " ₴";
+    const fmtDate = s => { const [y, m, d] = s.split("-"); return `${d}.${m}.${y}`; };
+    const esc = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+    function renderWarnings(warnings) {
+      const box = document.getElementById("warnings");
+      if (!warnings || !warnings.length) { box.innerHTML = ""; return; }
+      box.innerHTML = `<div class="warn-box warn-warning"><strong>Попередження:</strong><ul>${warnings.map(w => `<li>${esc(w)}</li>`).join("")}</ul></div>`;
+    }
+
+    function renderChart(labels, values, waterline) {
+      if (chart) chart.destroy();
+      chart = new Chart(document.getElementById("chart"), {
+        type: "line",
+        data: {
+          labels,
+          datasets: [
+            { label: "Баланс", data: values, borderColor: "#1971c2", fill: false, tension: 0.35, pointRadius: 0 },
+            { label: "Ватерлінія", data: labels.map(() => waterline), borderColor: "#c92a2a", borderDash: [8,4], fill: false, pointRadius: 0 }
+          ]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: { legend: { position: "top" } },
+          scales: {
+            x: { ticks: { maxTicksLimit: 10, callback: (_, i) => labels[i] ? fmtDate(labels[i]) : "" } },
+            y: { ticks: { callback: v => Number(v).toLocaleString("uk-UA") + " ₴" } }
+          }
+        }
+      });
+    }
+
+    function renderTable(rows, waterline) {
+      const tbody = document.getElementById("tbl");
+      tbody.innerHTML = "";
+      for (const row of rows) {
+        const danger = row.balance < waterline ? " danger" : "";
+        const tr = document.createElement("tr");
+        tr.innerHTML = `<td class="num">${row.day}</td><td class="date-cell">${fmtDate(row.date)}</td>
+          <td class="num${danger}"><input class="table-input" data-field="balance" data-day="${row.day}" type="number" step="0.01" value="${row.balance}"></td>
+          <td class="num"><input class="table-input" data-field="required_expense" data-day="${row.day}" type="number" step="0.01" value="${row.required_expense}"></td>
+          <td class="num"><input class="table-input" data-field="free_money" data-day="${row.day}" type="number" step="0.01" value="${row.free_money}"></td>`;
+        tbody.appendChild(tr);
+      }
+
+      tbody.querySelectorAll(".table-input").forEach((inp) => {
+        inp.addEventListener("input", () => {
+          const day = Number(inp.dataset.day);
+          const field = inp.dataset.field;
+          const idx = currentRows.findIndex(r => r.day === day);
+          if (idx === -1) return;
+          const value = Number(inp.value);
+          if (Number.isNaN(value)) return;
+          currentRows[idx][field] = Math.max(0, value);
+          if (field === "balance") {
+            renderChart(currentRows.map(r => r.date), currentRows.map(r => r.balance), currentWaterline);
+          }
+        });
+      });
+    }
+
+    async function load() {
+      const res = await fetch("/load");
+      if (res.status === 404) { window.location.href = "/"; return; }
+      if (!res.ok) throw new Error("Помилка завантаження");
+      const doc = await res.json();
+      const s = doc.settings;
+      currentRows = (doc.table || []).map(r => ({ ...r }));
+      currentWaterline = Number(doc.chart_data?.waterline || 0);
+      document.getElementById("sub").textContent = `${fmtDate(s.date_start)} - ${fmtDate(s.date_end)} | Ціль заощадження: ${s.savings_percent}%`;
+      renderWarnings(doc.meta?.warnings || []);
+      renderChart(doc.chart_data.labels, doc.chart_data.datasets.balance, doc.chart_data.waterline);
+      renderTable(currentRows, currentWaterline);
+    }
+
+    document.getElementById("btn-save-table").addEventListener("click", async () => {
+      const res = await fetch("/save-table", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ table: currentRows }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        alert(data.detail || "Не вдалося зберегти зміни таблиці");
+        return;
+      }
+      await load();
+    });
+
+    document.getElementById("btn-reset").addEventListener("click", async () => {
+      if (!confirm("Видалити збережений бюджет?")) return;
+      await fetch("/reset", { method: "DELETE" });
+      window.location.href = "/";
+    });
+
+    load().catch(e => {
+      document.getElementById("warnings").innerHTML = `<div class="warn-box warn-danger">${esc(e.message)}</div>`;
+    });
+  </script>
+</body>
+</html>
